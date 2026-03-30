@@ -238,177 +238,6 @@ function goto_sector(n) {
     }
 }
 
-///===================================================================================================
-///===================================================================================================
-/// Hex Dump Logic with ATR-specific enhancements
-/// - Adds jump links for directory entries and next sector pointers
-/// - Highlights "garbage" bytes in data sectors
-/// addr: the absolute byte offset in the file
-/// data: the full byte array of the ATR file
-/// i: the current index in the data array for this line
-/// len: how many bytes to display in this line (usually 16)
-/// sector_pos: the byte offset within the current sector (0 to sector_size-1)
-/// sector_num: the current sector number (0 for header, 1-3 for boot, 4+ for data)
-/// sector_size: the size of the current sector (128 for boot, 256 or 512 for data)
-/// last_valid_byte: the last byte offset in this sector that is considered valid data (used to identify "garbage" bytes)
-
-function hex_line(addr, data, i, len, sector_pos, sector_num, sector_size, last_valid_byte) {
-    var s = [hex(addr, 6) + " "];
-    var p = '';
-    var jump_link = "";
-
-    // 1. Directory Entry Jump (Sectors 361-368)
-    // Only at the start of a 16-byte directory record
-    if (sector_num >= 360 && sector_num <= 368 && (sector_pos % 16 === 0)) {
-        var start_sector = data[i + 3] | (data[i + 4] << 8);
-        if (start_sector > 0 && start_sector < 720) { // Basic valid range check
-            jump_link = ` <span class="jump-btn" onclick="goto_sector(${start_sector})">[Jump to File]</span>`;
-        }
-    }
-
-    // 2. Next Sector Jump (At the very end of any data sector)
-    else if (sector_pos === (sector_size - 16)) {
-        var next_hi = data[i + 13]; 
-        var next_lo = data[i + 14]; 
-        var next = ((next_hi & 0x03) << 8) | next_lo;
-        if (next > 0 && next < 720 && sector_num >= 3) {
-            var hex_num = hex(next, 4);
-            jump_link = ` <span class="jump-btn next-ptr" onclick="goto_sector(${next})">[Next: ${hex_num} (${next})]</span>`;
-        }
-    }
-
-    for (var k = 0; k < len; k++) {
-        var val = data[i + k];
-        var pos = sector_pos + k;
-        var hex_val = hex(val, 2);
-
-        var is_garbage = (pos > last_valid_byte && pos < (sector_size - 3));
-
-        var char = (val >= 0x20 && val <= 0x7E) ? escapestr(String.fromCharCode(val)) : '.';
-        p += is_garbage ? `<span class="garbage">${char}</span>` : char;
-
-        if (is_garbage) {
-            s.push(`<span class="garbage">${hex_val}</span> `);
-        } else {
-            // ... your existing [Jump] and standard hex logic ...
-            s.push(hex_val + " ");
-        }
-    }
-
-    return s.join('') + " " + p + jump_link;
-}
-
-function format_header(left, right) {
-    var totalWidth = 54; 
-    var currentLength = left.length + right.length;
-    var spacesNeeded = totalWidth - currentLength;
-    
-    if (spacesNeeded < 1) spacesNeeded = 1;
-    
-    return left + " ".repeat(spacesNeeded) + right;
-}
-
-function hex_dump(data, i, len, is_atr) {
-    var hex_output = [];
-    var sector_size = le16(data, 4) || 128; 
-    var last_valid_byte = 256; // Default full sector (125 bytes)
-
-    // // get a list of files 
-    var _fileCodeMap = {}; // Reset
-    if ( is_atr ) {
-        // Directory is Sectors 361-368. Each sector has 8 entries of 16 bytes.
-        for (var s = 361; s <= 368; s++) {
-            var offset = sector_offset(s-1,sector_size);
-            for (var e = 0; e < 8; e++) {
-                var dirIdx = offset + (e * 16);
-                var flags = data[dirIdx ];
-                // We include all entries (active or deleted)
-                if (flags !== 0) {
-                    var entry_index = ((s - 361) * 8) + e;
-                    var fileCode = entry_index << 2; // DOS 2.0 File Number format
-                    var name = toAscii(data, dirIdx  + 5, 11).trim();
-                    _fileCodeMap[fileCode] = name;
-                }
-            }
-        }
-    }
-
-    for (var j = 0; j < len; j += 16) {
-        var sector_num = -1;
-        var sector_pos = 0;
-        var current_size = 128; // Default for boot/header
-
-        if (is_atr) {
-            if (j < 16) {
-                sector_num = 0; // Header
-                sector_pos = j;
-            } else if (j < 400) {
-                // Boot Sectors 1-3 (128 bytes each)
-                sector_num = Math.floor((j - 16) / 128) + 1;
-                sector_pos = (j - 16) % 128;
-                current_size = 128;
-            } else {
-                // Data Sectors 4+
-                sector_num = Math.floor((j - 400) / sector_size) + 4;
-                sector_pos = (j - 400) % sector_size;
-                current_size = sector_size;
-            }
-
-            var is_data_sector = (sector_num >= 4 && sector_num < 360) || (sector_num > 368);
-            if (is_data_sector && sector_pos === 0) {
-                var s_idx = i + j; // the actual start of the sector in data
-                
-                var next_byte = data[s_idx + (current_size - 2)]; 
-                var count_byte = data[s_idx + (current_size - 1)];
-
-                // If the next byte is 0, this is the EOF sector
-                if (next_byte === 0) {
-                    last_valid_byte = count_byte - 1; // Limit data to first 32 bytes
-                } else {
-                    last_valid_byte = current_size - 4; // Full 125 bytes are valid
-                }
-            }
-
-            // Only push a label if we are at the EXACT start of a sector
-            if (sector_pos === 0) {
-                var label = `Sector ${hex(sector_num, 4)} (${sector_num})`;
-                if (sector_num === 0) label = "ATR Header";
-                else if (sector_num === 1) label = "BOOT Sector 1";
-                else if (sector_num === 2) label = "BOOT Sector 2";
-                else if (sector_num === 3) label = "BOOT Sector 3";
-                else if (sector_num === 4) label += ": DATA Start";
-                else if (sector_num === 360) label += ": VTOC";
-                else if (sector_num === 361) label += ": Directory Start";
-                else if (sector_num === 369) label += ": DATA Start";
-
-                var leftPart = `${label} `;
-                var rightPart = ``;
-
-                if ( (sector_num >= 4 && sector_num < 360) || sector_num > 368 ) { // Data sectors only
-                    var s_idx = i + j; // Absolute start of this sector
-                    
-                    // Peek at Byte 125 (File Code)
-                    var fileCode = data[s_idx + (current_size - 3)];
-                    var fileName = _fileCodeMap[fileCode & 0xFC] || "Unknown/Deleted";   // mask out location bits 
-                    var hexCode = hex(fileCode, 2);
-
-                    // Only show if the name is "clean" (A-Z, 0-9, and common symbols like !, *, .)
-                    if (fileName && /^[A-Z0-9\.\!\*\s]+$/i.test(fileName))
-                        rightPart = `[${hexCode} ${fileName}]`;
-                }
-                var fullHeader = format_header(leftPart, rightPart);
-                hex_output.push(`<span class="sector-header" id="sector-${sector_num}">${fullHeader}</span>`);
-            }
-        }
-
-        hex_output.push(hex_line(j, data, i + j, 16, sector_pos, sector_num, current_size, last_valid_byte));
-    }
-    return hex_output.join("\n");
-}
-
-//===================================================================================================
-//===================================================================================================
-
 var _fcanvas;
 function draw(ctx,s,x,y)
 {
@@ -634,11 +463,6 @@ var _font = [
     0x08,0x18,0x38,0x78,0x38,0x18,0x08,0x00,
     0x10,0x18,0x1c,0x1e,0x1c,0x18,0x10,0x00,
 ];
-
-function makefont()
-{
-	
-}
 
 //===================================================================================================
 //===================================================================================================
@@ -2332,7 +2156,7 @@ class AtariDisk {
                 const fileData = parentDisk.getFileData(this);
                 let output = [];
                 for (let j = 0; j < fileData.byteLength; j += 16) {
-                    output.push(hex_line(j, fileData, j, 16, j % 16, -1, 0, 16));
+                    output.push(parentDisk.renderHexLine(0, 16, Number.MAX_SAFE_INTEGER, null));
                 }
                 return output.join("\n");
             }
@@ -2374,7 +2198,7 @@ class AtariDisk {
         // Render the file header 
         const header = this.formatHeader(`ATR Header`, `` );
         retVal.push(`<span class="sector-header">${header}</span>`);     
-        retVal.push(hex_line(0, this.raw, 0, 16, 0, -1, 0, 16)); // ATR Header (16 bytes)
+        retVal.push(this.renderHexLine(0, 16, Number.MAX_SAFE_INTEGER, null)); 
         retVal.push(`${`Signature: 0x${hex(this.header.signature, 4)}`} `);
         retVal.push(`${`Sector Size: ${this.header.sectorSize} bytes`} `);
         retVal.push(`${`Total Sectors: ${this.sectorMap.length - 1}`} `);
@@ -2538,108 +2362,6 @@ class AtariDisk {
         
         return left + " ".repeat(spacesNeeded) + right;
     }
-
-
-
-
-// function hex_dump(data, i, len, is_atr) {
-//     var hex_output = [];
-//     var sector_size = le16(data, 4) || 128; 
-//     var last_valid_byte = 256; // Default full sector (125 bytes)
-
-//     // // get a list of files 
-//     var _fileCodeMap = {}; // Reset
-//     if ( is_atr ) {
-//         // Directory is Sectors 361-368. Each sector has 8 entries of 16 bytes.
-//         for (var s = 361; s <= 368; s++) {
-//             var offset = sector_offset(s-1,sector_size);
-//             for (var e = 0; e < 8; e++) {
-//                 var dirIdx = offset + (e * 16);
-//                 var flags = data[dirIdx ];
-//                 // We include all entries (active or deleted)
-//                 if (flags !== 0) {
-//                     var entry_index = ((s - 361) * 8) + e;
-//                     var fileCode = entry_index << 2; // DOS 2.0 File Number format
-//                     var name = toAscii(data, dirIdx  + 5, 11).trim();
-//                     _fileCodeMap[fileCode] = name;
-//                 }
-//             }
-//         }
-//     }
-
-//     for (var j = 0; j < len; j += 16) {
-//         var sector_num = -1;
-//         var sector_pos = 0;
-//         var current_size = 128; // Default for boot/header
-
-//         if (is_atr) {
-//             if (j < 16) {
-//                 sector_num = 0; // Header
-//                 sector_pos = j;
-//             } else if (j < 400) {
-//                 // Boot Sectors 1-3 (128 bytes each)
-//                 sector_num = Math.floor((j - 16) / 128) + 1;
-//                 sector_pos = (j - 16) % 128;
-//                 current_size = 128;
-//             } else {
-//                 // Data Sectors 4+
-//                 sector_num = Math.floor((j - 400) / sector_size) + 4;
-//                 sector_pos = (j - 400) % sector_size;
-//                 current_size = sector_size;
-//             }
-
-//             var is_data_sector = (sector_num >= 4 && sector_num < 360) || (sector_num > 368);
-//             if (is_data_sector && sector_pos === 0) {
-//                 var s_idx = i + j; // the actual start of the sector in data
-                
-//                 var next_byte = data[s_idx + (current_size - 2)]; 
-//                 var count_byte = data[s_idx + (current_size - 1)];
-
-//                 // If the next byte is 0, this is the EOF sector
-//                 if (next_byte === 0) {
-//                     last_valid_byte = count_byte - 1; // Limit data to first 32 bytes
-//                 } else {
-//                     last_valid_byte = current_size - 4; // Full 125 bytes are valid
-//                 }
-//             }
-
-//             // Only push a label if we are at the EXACT start of a sector
-//             if (sector_pos === 0) {
-//                 var label = `Sector ${hex(sector_num, 4)} (${sector_num})`;
-//                 if (sector_num === 0) label = "ATR Header";
-//                 else if (sector_num === 1) label = "BOOT Sector 1";
-//                 else if (sector_num === 2) label = "BOOT Sector 2";
-//                 else if (sector_num === 3) label = "BOOT Sector 3";
-//                 else if (sector_num === 4) label += ": DATA Start";
-//                 else if (sector_num === 360) label += ": VTOC";
-//                 else if (sector_num === 361) label += ": Directory Start";
-//                 else if (sector_num === 369) label += ": DATA Start";
-
-//                 var leftPart = `${label} `;
-//                 var rightPart = ``;
-
-//                 if ( (sector_num >= 4 && sector_num < 360) || sector_num > 368 ) { // Data sectors only
-//                     var s_idx = i + j; // Absolute start of this sector
-                    
-//                     // Peek at Byte 125 (File Code)
-//                     var fileCode = data[s_idx + (current_size - 3)];
-//                     var fileName = _fileCodeMap[fileCode & 0xFC] || "Unknown/Deleted";   // mask out location bits 
-//                     var hexCode = hex(fileCode, 2);
-
-//                     // Only show if the name is "clean" (A-Z, 0-9, and common symbols like !, *, .)
-//                     if (fileName && /^[A-Z0-9\.\!\*\s]+$/i.test(fileName))
-//                         rightPart = `[${hexCode} ${fileName}]`;
-//                 }
-//                 var fullHeader = format_header(leftPart, rightPart);
-//                 hex_output.push(`<span class="sector-header" id="sector-${sector_num}">${fullHeader}</span>`);
-//             }
-//         }
-
-//         hex_output.push(hex_line(j, data, i + j, 16, sector_pos, sector_num, current_size, last_valid_byte));
-//     }
-//     return hex_output.join("\n");
-// }
-
 }
 
 var _disks = [];
@@ -2749,7 +2471,6 @@ function renderState(disks)
         });
     }, 0); 
 }
-
 
 function renderFile(file)
 {
