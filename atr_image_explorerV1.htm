@@ -238,20 +238,6 @@ function goto_sector(n) {
     }
 }
 
-///===================================================================================================
-///===================================================================================================
-/// Hex Dump Logic with ATR-specific enhancements
-/// - Adds jump links for directory entries and next sector pointers
-/// - Highlights "garbage" bytes in data sectors
-/// addr: the absolute byte offset in the file
-/// data: the full byte array of the ATR file
-/// i: the current index in the data array for this line
-/// len: how many bytes to display in this line (usually 16)
-/// sector_pos: the byte offset within the current sector (0 to sector_size-1)
-/// sector_num: the current sector number (0 for header, 1-3 for boot, 4+ for data)
-/// sector_size: the size of the current sector (128 for boot, 256 or 512 for data)
-/// last_valid_byte: the last byte offset in this sector that is considered valid data (used to identify "garbage" bytes)
-
 function hex_line(addr, data, i, len, sector_pos, sector_num, sector_size, last_valid_byte) {
     var s = [hex(addr, 6) + " "];
     var p = '';
@@ -488,7 +474,7 @@ function show_ataritext(f,lst)
         wrap.push(s);
     });
 
-    renderFile(f);
+    render_file(f);
 
     var c = _q("#show");
     c.width = 40*8;
@@ -2108,33 +2094,13 @@ function get_ext(name,a)
     return "dat";
 }
 
-var _id = 0;
+var _id = 1;
 var _containers = [];
-
-/**
- * Retrieves a file metadata object from the global disk collection using its unique ID.
- * @param {string} id - The unique file ID which includes disk id (e.g., "d1-f1").
- * @returns {object|null} - The file metadata object or null if not found.
- */
-function getFile(id) {
-    if (!id) return null;
-
-    // find the disk object that contains this file 
-    const diskId = id.split("-f")[0];  // extract the disk ID from the file ID (assuming format "diskId-fX")
-    const disk = _disks.find(d => String(d.id) === diskId);
-    if (!disk) {
-        console.error("Disk not found for ID:", diskId);
-        return null;
-    }
-
-    // find and areturn the file metadata 
-    const file = disk.files.find(f => f.id === id);
-    if (!file) {
-        console.error("File not found for ID:", id);
-        return null;
-    }
-
-    return file;
+function get_file(id)
+{
+    var f;
+    _containers.forEach(c => c.files.forEach(i => { if(i.id == id) f = i}));
+    return f;
 }
 
 var _shown;
@@ -2192,571 +2158,166 @@ function xex_dump(name,a,i,len)
     return lines.join("\n");
 }
 
-// const myDisk = new AtariDisk("MYDISK.ATR", fileBuffer);
-// https://www.atariarchives.org/iad/chapter2.php   
-class AtariDisk {
-    constructor(id, filename, arrayBuffer) {
-        this.id = id;
-        this.filename = filename;
-        this.raw = new Uint8Array(arrayBuffer);
-        
-        // First 16 bytes are the ATR Header, signature is $96 $02
-        this.header = {
-            signature: (this.raw[0] << 8) | this.raw[1],    // Should be 0x296
-            sectorSize: this.raw[4] + (this.raw[5] << 8),   // 128 (Single/Enhanced) or 256 (Double)
-            paragraphs: this.raw[2] + (this.raw[3] << 8)    // Number of 16-byte paragraphs in the disk image 
-        };
-
-        this.sectorMap = [];
-        this.files = [];
-        
-        this.initSectorMap();
-        this.parseBootSectors();
-        this.parseFileSystem();
-    }
-
-    // Map out every sector's byte offset in the ATR blob
-    initSectorMap() {
-        const totalSectors = Math.floor((this.raw.length - 16) / this.header.sectorSize);
-        for (let i = 1; i <= totalSectors; i++) {
-            this.sectorMap[i] = {
-                index: i,
-                offset: 16 + (i - 1) * this.header.sectorSize,
-                type: 'unknown',
-                fileId: null
-            };
-        }
-    }
-
-    getSectorData(index) {
-        const s = this.sectorMap[index];
-        return this.raw.slice(s.offset, s.offset + this.header.size);
-    }
-
-    parseBootSectors() {
-        const s1 = this.sectorMap[1];
-        const bootCount = this.raw[s1.offset + 1]; // Offset 1 in Sector 1, number of boot sectors (including this one)
-        
-        for (let i = 1; i <= bootCount; i++) {
-            if (this.sectorMap[i]) this.sectorMap[i].type = 'boot';
-        }
-    }
-
-    parseFileSystem() {
-        // Standard DOS 2.0/2.5 locations
-        const vtocIdx = 360;
-        const dirStart = 361;
-        const dirEnd = 368;
-
-        if (this.sectorMap[vtocIdx]) this.sectorMap[vtocIdx].type = 'vtoc';
-
-        let fileId = 0; 
-        for (let i = dirStart; i <= dirEnd; i++) {
-            const s = this.sectorMap[i];
-            s.type = 'directory';
-            
-            // Each sector has 8 entries (16 bytes each)
-            for (let entry = 0; entry < 8; entry++) {
-                const entryOffset = s.offset + (entry * 16);
-                const flag = this.raw[entryOffset];
-                
-                // If flag has "In Use" bit (bit 1) set
-                if (flag & 0x02) {
-                    const file = this.extractFileMetadata(entryOffset, fileId++);
-                    this.walkSectorChain(file); 
-                    this.files.push(file);
-                }
-            }
-        }
-    }
-
-    walkSectorChain(file) {
-        let currentSector = file.startSector;
-        const visited = new Set(); // Prevent infinite loops on corrupt disks
-        let totalBytes = 0; 
-
-        while (currentSector > 0 && currentSector < this.sectorMap.length) {
-            if (visited.has(currentSector)) break; // Circular link detected
-            visited.add(currentSector);
-            
-            file.sectors.push(currentSector);
-
-            // Mark the sector map so we know who owns this
-            if (this.sectorMap[currentSector]) {
-                this.sectorMap[currentSector].type = 'data';
-                this.sectorMap[currentSector].fileId = file.id;
-            }
-
-            // Get the link to the next sector (Standard DOS 2.0 logic)
-            const offset = this.sectorMap[currentSector].offset;
-
-            // Byte 127: The actual number of data bytes in this sector (0-125)
-            const bytesInThisSector = this.raw[offset + 127];
-
-            // Last 3 bytes of 128-byte sector: [nextHi, nextLo, byteCount]
-            const nextHi = this.raw[offset + 125] & 0x03;
-            const nextLo = this.raw[offset + 126];
-            const nextSector = (nextHi << 8) | nextLo;
-
-            if (nextSector === 0) { // last sector in the chain
-                totalBytes += bytesInThisSector;
-                break;
-            } else {
-                totalBytes += 125;
-                currentSector = nextSector;
-            }
-
-            file.byteLength = totalBytes; // Update file size as we go; 
-        }
-    }
-
-    extractFileMetadata(offset, index) {
-        const id = `${this.id}-f${index}`; // e.g. "disk-a1b2c3-f4"
-        const name = String.fromCharCode(...this.raw.slice(offset + 5, offset + 13)).trim();
-        const ext = String.fromCharCode(...this.raw.slice(offset + 13, offset + 16)).trim();
-        
-        const parentDisk = this; 
-
-        return {
-            id: id,
-            diskId: this.id,
-            name: `${name}`,
-            ext: `${ext}`,
-            fullName: `${name}.${ext}`,
-            flag: this.raw[offset],
-            sectorCount: this.raw[offset + 1] + (this.raw[offset + 2] << 8),
-            startSector: this.raw[offset + 3] + (this.raw[offset + 4] << 8),
-            isLocked: (this.raw[offset] & 0x01) !== 0,
-            sectors: [], // will be filled in by walkSectorChain
-            renderHex: function() {
-                const fileData = parentDisk.getFileData(this);
-                let output = [];
-                for (let j = 0; j < fileData.byteLength; j += 16) {
-                    output.push(hex_line(j, fileData, j, 16, j % 16, -1, 0, 16));
-                }
-                return output.join("\n");
-            }
-        };
-    }
-
-    getFileData(file) {
-        const totalBytes = file.sectors.length * (this.header.sectorSize - 3); // approx for DOS 2.0
-        const out = new Uint8Array(totalBytes);
-        let ptr = 0;
-
-        file.sectors.forEach((secIdx, i) => {
-            const start = this.sectorMap[secIdx].offset;
-            const isLast = (i === file.sectors.length - 1);
-            
-            // DOS 2.0: last 3 bytes are metadata, byte 127 is data length
-            const count = isLast ? this.raw[start + 127] : 125; 
-            
-            out.set(this.raw.subarray(start, start + count), ptr);
-            ptr += count;
-        });
-
-        return out.subarray(0, ptr); // trim to exact file size
-    }
-
-    getFileById(fileId) {
-        return this.files.find(f => f.id === fileId);
-    }
-
-    getFileByStartSector(sectorIndex) {
-        return this.files.find(f => f.startSector === sectorIndex);
-    }   
-
-    renderHex() {
-
-        let retVal = [];
-        const lineLenth = 16;
-
-        // Render the file header 
-        const header = this.formatHeader(`ATR Header`, `` );
-        retVal.push(`<span class="sector-header">${header}</span>`);     
-        retVal.push(hex_line(0, this.raw, 0, 16, 0, -1, 0, 16)); // ATR Header (16 bytes)
-        retVal.push(`${`Signature: 0x${hex(this.header.signature, 4)}`} `);
-        retVal.push(`${`Sector Size: ${this.header.sectorSize} bytes`} `);
-        retVal.push(`${`Total Sectors: ${this.sectorMap.length - 1}`} `);
-
-        // Render all other sectors in order 
-        for ( let i = 1; i < this.sectorMap.length; i++) {
-            retVal.push(this.renderHexSector(i, lineLenth));
-        }
-
-        return retVal.join("\n");
-    }
-
-    renderVTOC(vtocSector) {
-        // Byte 0: Type Code (0 in DOS 2.0)
-        // Byte 1,2: Total number of sectors 
-        // Byte 3,4: Number of unused sectors 
-        // Byte 5: Reserved
-        // Bytes $0A-$63: Bitmap of used (1) vs unused (0) sectors, starting with sector 1 at bit 0 of byte $0A. So byte $0A's bits represent sectors 1-8, 
-        //      byte $0B is sectors 9-16, etc. A disk with 720 sectors would use 90 bytes for the bitmap (720/8).
-
-        const typeCode = this.raw[vtocSector.offset];
-        const totalSectors = this.raw[vtocSector.offset + 1] + (this.raw[vtocSector.offset + 2] << 8);
-        const unusedSectors = this.raw[vtocSector.offset + 3] + (this.raw[vtocSector.offset + 4] << 8);
-        const reserved = this.raw[vtocSector.offset + 5];
-
-        let retVal = [];
-        const header = this.formatHeader(`Sector 168 (360): VTOC`, `` );
-        retVal.push(`<span class="sector-header" id="sector-360">${header}</span>`);     
-        retVal.push(`Type=${typeCode}, Total=${totalSectors}, Unused=${unusedSectors}`);     
-
-        // Render the bitmap in a human-friendly way, 54 sectors per line for readability (720 sectors / 54 ≈ 13 lines)
-        const sectorsPerLine = 45;
-        for (let lineStart = 1; lineStart <= totalSectors; lineStart += sectorsPerLine) {
-            let line = [];
-            for (let s = lineStart; s < lineStart + sectorsPerLine && s <= totalSectors; s++) {
-                const byteIndex = vtocSector.offset + 0x0A + Math.floor((s - 1) / 8);
-                const bitIndex  = (s - 1) % 8;
-
-                const isUsed = (this.raw[byteIndex] >> bitIndex) & 1;
-
-                line.push(isUsed ? '.' : '#');
-            }
-
-            // Add a label at the start of each line
-            const label = `${String(lineStart).padStart(3, '0')}-${String(Math.min(lineStart + sectorsPerLine - 1, totalSectors)).padStart(3, '0')}`;
-
-            retVal.push(`${label}: ${line.join('')}`);
-        }
-
-        return retVal.join('\n');
-    }
-
-    renderHexSector(sectorIndex, lineLength) {
-
-        let retVal = [];
-
-        const sector = this.sectorMap[sectorIndex];
-
-        // If it's the VTOC sector, render it separately with VTOC-specific formatting
-        if (sector.type === 'vtoc') {
-            retVal.push(this.renderVTOC(sector));
-            return retVal.join("\n");
-        }
-
-        // Get some key metadata about this sector to display in the header (like file number, bytes used, and next sector link if it's a data sector)
-        const bytesUsed = this.raw[sector.offset + 127];
-        const byte125 = this.raw[sector.offset + 125];
-        const byte126 = this.raw[sector.offset + 126];
-        const ownedByFileId = byte125 >> 2; // left six bits 
-        const nextSectorIndex = ( byte125 & 0x03 ) << 8 | byte126; // right 2 bits (8&9) of 125 combined with the 8 bits of 126
-
-        // Render the sector header line with sector info
-        const desc =
-            sector.type === 'boot' ? ': BOOT Sector' :
-            sector.type === 'vtoc' ? ': VTOC' :
-            sector.type === 'directory' ? ': Directory' :
-            ': Data';
-
-        let ownedByFile = null;
-        let headerRight = '';
-        if (sector.type === 'data') {
-            ownedByFile = this.getFileById(`${this.id}-f${ownedByFileId}`);
-            headerRight = bytesUsed > 0 ? `[${ownedByFileId} ${ownedByFile?.fullName ?? "Unknown" }]` : '';
-        }
-        
-        // Format the header like with filename right justified
-        const headerLeft = `Sector ${hex(sectorIndex, 3)} (${sectorIndex})${desc}`;
-        const header = this.formatHeader(headerLeft, headerRight);
-        retVal.push(`<span class="sector-header" id="sector-${sectorIndex}">${header}</span>`);     
-        
-        // Render each line in this sector, adding jump buttons where appropriate (links to next sector or file)
-        for( let i = 0; i < this.header.sectorSize; i += lineLength) {
-            const offset = sector.offset + i;
-
-            // If it's the last line of a data sector that has a link to the next sector, then add a jump button to the next sector
-            let jumpData = null;
-            if (sector.type === 'data' && i + lineLength >= this.header.sectorSize && nextSectorIndex > 0) {
-                jumpData = { label: `[Next: ${hex(nextSectorIndex,4)} (${nextSectorIndex})]`, style: 'data-jump', sector: nextSectorIndex };
-            }
-
-            // Otherwise, if it's a directory sector, add a jump button to the file it represents (if any)
-            else if (sector.type === 'directory') {
-                const startSector = this.raw[offset + 3] + (this.raw[offset + 4] << 8); 
-                const file = this.getFileByStartSector(startSector);
-                if (file) {
-                    // Other file data availabel here if needed:
-                    jumpData = { label: `[Jump to File]`, style: 'file-jump', sector: file.startSector };
-                }
-            }
-
-            const isLastSector = nextSectorIndex === 0;
-            const lastValidByteId = isLastSector
-                ? sector.offset + bytesUsed - 1
-                : sector.offset + 124; // full 125 bytes assumed valid
-
-            retVal.push(this.renderHexLine(offset, 16, lastValidByteId, jumpData));
-        }   
-
-        return retVal.join("\n");
-    }
-
-    renderHexLine(offset, length, lastValidByteId, jumpData) {
-
-        // Set the offset for this line
-        var retVal = [hex(offset, 6) + " "];
-
-        // Collect all the HEX and ascii characters for this line, applying ATR-specific logic
-        var ascii = ''; 
-        for (var byteIdx = 0; byteIdx < length; byteIdx++) {
-            let rawPos = offset + byteIdx;; 
-            var byte = this.raw[rawPos];
-            var hexVal = hex(byte, 2);
-            var isGarbage = (rawPos > lastValidByteId);
-
-            // The character to display for this byte (dot for non-printable, or the actual char)
-            var char = (byte >= 0x20 && byte <= 0x7E) ? escapestr(String.fromCharCode(byte)) : '.';
-
-            if ( isGarbage) {
-                ascii += `<span class="garbage">${char}</span>`;
-                retVal.push(`<span class="garbage">${hexVal}</span> `);
-            }
-            else {
-                ascii += char;
-                retVal.push(hexVal + " ");
-            }
-        }
-
-        if (jumpData) {
-            ascii += ` <span class="jump-btn ${jumpData.style}" onclick="goto_sector(${jumpData.sector})">${jumpData.label}</span>`;
-        }
-
-        return retVal.join("") + " " + ascii;
-    }
-
-    formatHeader(left, right) {
-        var totalWidth = 54; 
-        var currentLength = left.length + right.length;
-        var spacesNeeded = totalWidth - currentLength;
-        
-        if (spacesNeeded < 1) spacesNeeded = 1;
-        
-        return left + " ".repeat(spacesNeeded) + right;
-    }
-
-
-
-
-// function hex_dump(data, i, len, is_atr) {
-//     var hex_output = [];
-//     var sector_size = le16(data, 4) || 128; 
-//     var last_valid_byte = 256; // Default full sector (125 bytes)
-
-//     // // get a list of files 
-//     var _fileCodeMap = {}; // Reset
-//     if ( is_atr ) {
-//         // Directory is Sectors 361-368. Each sector has 8 entries of 16 bytes.
-//         for (var s = 361; s <= 368; s++) {
-//             var offset = sector_offset(s-1,sector_size);
-//             for (var e = 0; e < 8; e++) {
-//                 var dirIdx = offset + (e * 16);
-//                 var flags = data[dirIdx ];
-//                 // We include all entries (active or deleted)
-//                 if (flags !== 0) {
-//                     var entry_index = ((s - 361) * 8) + e;
-//                     var fileCode = entry_index << 2; // DOS 2.0 File Number format
-//                     var name = toAscii(data, dirIdx  + 5, 11).trim();
-//                     _fileCodeMap[fileCode] = name;
-//                 }
-//             }
-//         }
-//     }
-
-//     for (var j = 0; j < len; j += 16) {
-//         var sector_num = -1;
-//         var sector_pos = 0;
-//         var current_size = 128; // Default for boot/header
-
-//         if (is_atr) {
-//             if (j < 16) {
-//                 sector_num = 0; // Header
-//                 sector_pos = j;
-//             } else if (j < 400) {
-//                 // Boot Sectors 1-3 (128 bytes each)
-//                 sector_num = Math.floor((j - 16) / 128) + 1;
-//                 sector_pos = (j - 16) % 128;
-//                 current_size = 128;
-//             } else {
-//                 // Data Sectors 4+
-//                 sector_num = Math.floor((j - 400) / sector_size) + 4;
-//                 sector_pos = (j - 400) % sector_size;
-//                 current_size = sector_size;
-//             }
-
-//             var is_data_sector = (sector_num >= 4 && sector_num < 360) || (sector_num > 368);
-//             if (is_data_sector && sector_pos === 0) {
-//                 var s_idx = i + j; // the actual start of the sector in data
-                
-//                 var next_byte = data[s_idx + (current_size - 2)]; 
-//                 var count_byte = data[s_idx + (current_size - 1)];
-
-//                 // If the next byte is 0, this is the EOF sector
-//                 if (next_byte === 0) {
-//                     last_valid_byte = count_byte - 1; // Limit data to first 32 bytes
-//                 } else {
-//                     last_valid_byte = current_size - 4; // Full 125 bytes are valid
-//                 }
-//             }
-
-//             // Only push a label if we are at the EXACT start of a sector
-//             if (sector_pos === 0) {
-//                 var label = `Sector ${hex(sector_num, 4)} (${sector_num})`;
-//                 if (sector_num === 0) label = "ATR Header";
-//                 else if (sector_num === 1) label = "BOOT Sector 1";
-//                 else if (sector_num === 2) label = "BOOT Sector 2";
-//                 else if (sector_num === 3) label = "BOOT Sector 3";
-//                 else if (sector_num === 4) label += ": DATA Start";
-//                 else if (sector_num === 360) label += ": VTOC";
-//                 else if (sector_num === 361) label += ": Directory Start";
-//                 else if (sector_num === 369) label += ": DATA Start";
-
-//                 var leftPart = `${label} `;
-//                 var rightPart = ``;
-
-//                 if ( (sector_num >= 4 && sector_num < 360) || sector_num > 368 ) { // Data sectors only
-//                     var s_idx = i + j; // Absolute start of this sector
-                    
-//                     // Peek at Byte 125 (File Code)
-//                     var fileCode = data[s_idx + (current_size - 3)];
-//                     var fileName = _fileCodeMap[fileCode & 0xFC] || "Unknown/Deleted";   // mask out location bits 
-//                     var hexCode = hex(fileCode, 2);
-
-//                     // Only show if the name is "clean" (A-Z, 0-9, and common symbols like !, *, .)
-//                     if (fileName && /^[A-Z0-9\.\!\*\s]+$/i.test(fileName))
-//                         rightPart = `[${hexCode} ${fileName}]`;
-//                 }
-//                 var fullHeader = format_header(leftPart, rightPart);
-//                 hex_output.push(`<span class="sector-header" id="sector-${sector_num}">${fullHeader}</span>`);
-//             }
-//         }
-
-//         hex_output.push(hex_line(j, data, i + j, 16, sector_pos, sector_num, current_size, last_valid_byte));
-//     }
-//     return hex_output.join("\n");
-// }
-
-}
-
-var _disks = [];
-var diskId = 0; 
-var fileId = 0; 
-function loadDisk(name,bytes)
+function show(id)
 {
-    try {
-        _disks.push( new AtariDisk( diskId++, name, bytes) );
-    } catch (e) {
-        alert("Please drop an .ATR file. Error: " + e.message);
+	var f = get_file(id);
+    _shown = f;
+    if (f.ext == "bas") {
+        show_bas(f);
+        return;
+    }
+
+    var e = _exts[f.ext];
+    if (e && e.is_txt) {
+        show_txt(f);
+        return;
+    }
+
+    render_file(f);
+    if (e && e.is_code) {
+        _h("#show",xex_dump(f.file_name,f.data,0,f.data.length));
+        return;
+    }
+    _h("#show",hex_dump(f.data,0,f.data.length, false));
+}
+
+function show_all(container_name)
+{
+    var c = _containers.find(item => item.name === container_name);
+    _shown = c; 
+
+    render_container(c);
+    _h("#show",hex_dump(c.data,0,c.data.length, true));
+}
+
+function load_data(name,a)
+{
+	// http://www.atarimax.com/jindroush.atari.org/afmtatr.html
+    var ext = get_ext(name,a);
+
+	if (ext != "atr") {        // not an atr file
+        var f = {file_name:name,name:name,ext:ext,data:a,id:_id++,total:(a.length+127)>>7};
+        _containers.push({name:name,ext:ext,data:a,files:[f]});         // single file
+	} else {
+
+        function file_read(f)
+        {
+            var ss = atr.sector_size;
+            var data = [];
+            var count = f.total;
+            var sector = f.start;
+            var a = atr.data;
+            while (count--) {
+                var i = sector_offset(sector, atr.sector_size);
+                var len = a[i+(ss-1)];
+                for (var k = 0; k < len; k++)
+                    data.push(a[i + k]);
+                var num = a[i+(ss-3)] >> 2;
+                if (num != f.number)
+                    return null;
+                var next = ((a[i+(ss-3)] & 0x3) << 8) | (a[i+(ss-2)]);
+                sector = next-1;
+            }
+            return new Uint8Array(data);
+        }
+
+        var atr = {data:a,name:name};
+    	atr.size = le16(a,2) << 4;
+    	atr.sector_size = le16(a,4);
+    	atr.size += a[6] << 16;
+
+    	//	dump contents
+    	//	http://atari.kensclassics.org/dos.htm
+        var files = [];
+        var num = 0;
+    	for (var s = 360; s < 368; s++) { // the directory is in 361-368
+    		var i = sector_offset(s, atr.sector_size);
+    		for (var e = 0; e < atr.sector_size/16; e++) {
+    			var f = {flags:a[i],total:le16(a,i+1),start:le16(a,i+3)-1};
+    			f.number = num++;
+    			if (f.flags & 0x40) {
+                    f.file_name = toAscii(a,i+5,8).trim() + "." + toAscii(a,i+13,3).trim();
+                    f.name = toAscii(a,i+5,11).trim();
+                    f.data = file_read(f);
+                    if (f.data) {
+                        f.id = _id++;
+                        f.ext = get_ext(f.file_name,f.data);
+                        files.push(f);
+                        console.log( name, f.file_name, f.ext, f.data.length ); 
+
+                    }
+    			}
+    			i += 16;
+    		}
+    	}
+        _containers.push({name:name,length:a.length,data:a,ext:"atr",files:files});
     }
 }
 
 //===================================================================================================
 //===================================================================================================
-// Originally (but heavily modified) from https://www.atarimagazines.com/software/software.html
+// https://www.atarimagazines.com/software/software.html
 
 function load()
 {
-    drop_init(_q("body"),function(file,data) {
-    	loadDisk(file.name,new Uint8Array(data));
-        renderState(_disks);
-        // user should click on a file or disk to show it 
+    drop_init(_q("body"),function(file,ab) {
+    	load_data(file.name,new Uint8Array(ab));
+        render_state(_containers);
+        if ( _containers[_containers.length-1].files.length > 0 )
+            show(_containers[_containers.length-1].files[0].id);    // select one
+        else 
+            show_all(_containers[_containers.length-1].name); // show everything 
     });
     get_font();
 }
 
-function showFileDump(fileId) {
-    const f = getFile(fileId);
-    if (!f) return;
-    const disk = _disks.find(d => d.id === f.diskId);
-    
-    _shown = f;
-
-    const ext = f.ext.toLowerCase();
-    if (ext === "bas") return show_bas(f);
-
-    const e = _exts[ext];
-    if (e?.is_txt) return show_txt(f);
-
-    renderFile(f); 
-    
-    const content = (e?.is_code) 
-        ? xex_dump(f.name, disk.getFileData(f), 0, f.byteLength)
-        : f.renderHex();
-        
-    _h("#show", content);
-}
-
-function showDiskDump(diskId) {
-    // Find the actual disk object by its unique ID
-    const disk = _disks.find(d => String(d.id) === diskId);
-
-    _shown = disk; 
-
-    renderDisk(disk); // Update UI for the disk name/info
-    
-    // Show the entire raw ATR blob (including header)
-    _h("#show", disk.renderHex());
-}
-
-function renderState(disks)
+function finfo(f)
 {
-    function diskSummary(disk) {
-        var size = disk.raw.length;
-        var type = disk.header.sectorSize === 256 ? "Double Density" : "Single Density";
+    var t = _exts[f.ext] ? _exts[f.ext].name : "'" + f.ext + "' file";
+    var res = ( f.ext == "atr" )   
+        ? `<b>${f.name}</b> <span class="jump-btn next-ptr" onclick="show_all('${f.name}')">[Full ATR]</span><br/>(${f.data.length} bytes) ${t}`
+        : `<b>${f.name}</b><br/>(${f.data.length} bytes) ${t}`;
+    return res;
+}
 
-        return `<b>${disk.filename}</b> 
-                <span class="jump-btn next-ptr" onclick="showDiskDump('${disk.id}')">[Full ATR]</span><br/>
-                (${size} bytes) ${type} ATR Image`;
-    }
-
-    // map the HTML 
-    var h = disks.map(disk => {
-        return `<div><div class='info'>${diskSummary(disk)}</div>
-            <ul id="file-menu">
-            ${disk.files.map(file => 
-                `<li onclick="showFileDump('${file.id}')">
-                    <canvas id="canvas_${file.id}"></canvas>
+function render_state(m)
+{
+    var h = m.map(container => 
+        `<div><div class='info'>${finfo(container)}</div>
+            <ul id="menu">
+            ${container.files.map(file => 
+                `<li onclick="show(${file.id})">
+                    <canvas id="canvas${file.id}"></canvas>
                 </li>`
             ).join("")}
             </ul>
-        </div>`;
-    }).join("");
-
-    // inject into the page
+        </div>`
+    ).join("");
     _h("#menu_container",h);
 
-    // helper to formal directory entry lines with proper padding and locked status
-    function getDirectoryLine(f) {
-        var s = f.sectorCount.toString().padStart(3, '0');  // pad sector count 
-        var n = f.name.padEnd(8, ' '); // pad name 
-        var e = f.ext.padEnd(3, ' '); // pad name 
-        var locked = f.isLocked ? "*" : " ";
-        
-        return `  ${locked} ${n}${e} ${s}  `;
+    function info(f)
+    {
+        var s = '' + f.total;
+        while (s.length < 3)
+            s = '0' + s;
+        var n = f.name;
+        while (n.length < 12)
+            n += ' ';
+        var locked = f.flags & 0x20 ? "*" : " ";
+        return "  " + locked + " " + n + s + "  ";
     }
 
-    // wait for the DOM to catch up aand draw to the camvas 
-    setTimeout(() => {
-        disks.forEach(disk => {
-            disk.files.forEach(file => {
-                // Use the same ID prefix we used in the HTML map above
-                draw_line(`#canvas_${file.id}`, getDirectoryLine(file));
-            });
-        });
-    }, 0); 
+    m.forEach(container => {
+        container.files.forEach(file => draw_line(`#canvas${file.id}`,info(file)));
+    });
 }
 
-
-function renderFile(file)
+function render_file(f)
 {
-    var txt = _exts[file.ext.toLowerCase()] ? _exts[file.ext.toLowerCase()].is_txt : 0;
+    var txt = _exts[f.ext] ? _exts[f.ext].is_txt : 0;
     _h("#tabs",
         `<div class='info'>
-            <b>${file.fullName}</b><br/>(${file.byteLength} bytes) ${_exts[file.ext.toLowerCase()] ? _exts[file.ext.toLowerCase()].name : "'" + file.ext + "' file"}
+            ${finfo(f)}
             ${txt ? `<button style="float:right;" onclick="save(1)">Save As LST</button>` : ""}
             <button style="float:right;" onclick="save(0)">Download</button>
         </div>
@@ -2764,7 +2325,7 @@ function renderFile(file)
     );
 }
 
-function renderDisk(disk)
+function render_container(c)
 {
     _h("#tabs",
         `<div class='info'>
@@ -2787,8 +2348,7 @@ function renderDisk(disk)
 <div style="display:flex;flex-direction:row">
 <nav style="min-width:336px; margin-right:8px;" id="toc">
 <div id="menu_container" ><h2 style="text-align:center;color:#AAA">Drag Files Here<br/>(ATR,BAS,LST,XEX)</h2></div>
-<p style="text-align:center;"><a style="color:#AAA" href="https://github.com/alexfranke/Atari-ATR-Explorer-Web">Visit on GitHub.</a></p>
-<p style="text-align:center;">originally from <a style="color:#AAA" href="https://github.com/rossumur/esp_8_bit">this project</a>.</p>
+<p style="text-align:center;"><a style="color:#AAA" href="https://github.com/rossumur/esp_8_bit">https://github.com/rossumur/esp_8_bit</a></p>
 </nav>
 <main style="border:solid 1px #CCC">
     <div id="tabs"></div>
