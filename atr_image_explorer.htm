@@ -205,22 +205,6 @@ function escapestr(c)
 	return c;
 }
 
-function esc(s)
-{
-	var n = '';
-	for (var i = 0; i < s.length; i++)
-		n+= escapestr(s.charAt(i));
-	return n;
-}
-
-function sector_offset(n, sector_size)
-{
-    if (n <= 3)
-        return 16 + n*0x80;     // header is 16 bytes
-    return 16 + 3*0x80 + (n-3)*sector_size;
-}
-
-
 function goto_sector(n) {
     const element = document.getElementById(`sector-${n}`);
     if (element) {
@@ -2035,7 +2019,7 @@ class AtariDisk {
         this.files = [];
         
         this.initSectorMap();
-        this.parseBootSectors();
+        this.bootData = this.parseBootSectors();
         this.parseFileSystem();
     }
 
@@ -2059,11 +2043,21 @@ class AtariDisk {
 
     parseBootSectors() {
         const s1 = this.sectorMap[1];
+        const bootable = this.raw[s1.offset + 0]; // Offset 0 in Sector 1, indicates if disk is bootable
         const bootCount = this.raw[s1.offset + 1]; // Offset 1 in Sector 1, number of boot sectors (including this one)
+        const loadAddy = this.raw[s1.offset + 2] + (this.raw[s1.offset + 3] << 8); // Offset 2-3 in Sector 1, load address
+        const runAddy = this.raw[s1.offset + 4] + (this.raw[s1.offset + 5] << 8); // Offset 4-5 in Sector 1, run address
         
         for (let i = 1; i <= bootCount; i++) {
             if (this.sectorMap[i]) this.sectorMap[i].type = 'boot';
         }
+
+        return {
+            bootable,
+            bootCount,
+            loadAddy,
+            runAddy
+        };
     }
 
     parseFileSystem() {
@@ -2087,8 +2081,10 @@ class AtariDisk {
                 // If flag has "In Use" bit (bit 1) set
                 if (flag & 0x02) {
                     const file = this.extractFileMetadata(entryOffset, fileId++);
-                    this.walkSectorChain(file); 
-                    this.files.push(file);
+                    if (file.flags.isInUse && !file.flags.isDeleted) {
+                        this.walkSectorChain(file);
+                        this.files.push(file);
+                    }   
                 }
             }
         }
@@ -2141,16 +2137,27 @@ class AtariDisk {
         
         const parentDisk = this; 
 
+        // Decode bit flags
+        const flag = this.raw[offset];
+        const flags = {
+            raw: flag,
+            isDeleted: (flag & 0x80) !== 0,
+            isInUse:   (flag & 0x40) !== 0,
+            isLocked:  (flag & 0x20) !== 0,
+            isDos2:    (flag & 0x02) !== 0,
+            isOpen:    (flag & 0x01) !== 0
+        };
+
         return {
             id: id,
             diskId: this.id,
             name: `${name}`,
             ext: `${ext}`,
             fullName: `${name}.${ext}`,
-            flag: this.raw[offset],
+            flag: flag,
+            flags: flags,
             sectorCount: this.raw[offset + 1] + (this.raw[offset + 2] << 8),
             startSector: this.raw[offset + 3] + (this.raw[offset + 4] << 8),
-            isLocked: (this.raw[offset] & 0x01) !== 0,
             sectors: [], // will be filled in by walkSectorChain
             renderHex: function() {
                 const fileData = parentDisk.getFileData(this);
@@ -2190,18 +2197,30 @@ class AtariDisk {
         return this.files.find(f => f.startSector === sectorIndex);
     }   
 
+    prettyByte(byte, length = 2) {
+        return `${hex(byte, length)} (${byte})`;
+    }
+
     renderHex() {
 
         let retVal = [];
         const lineLenth = 16;
 
         // Render the file header 
-        const header = this.formatHeader(`ATR Header`, `` );
+        let header = this.formatHeader(`ATR Header`, `` );
         retVal.push(`<span class="sector-header">${header}</span>`);     
         retVal.push(this.renderHexLine(0, 16, Number.MAX_SAFE_INTEGER, null)); 
         retVal.push(`${`Signature: 0x${hex(this.header.signature, 4)}`} `);
         retVal.push(`${`Sector Size: ${this.header.sectorSize} bytes`} `);
         retVal.push(`${`Total Sectors: ${this.sectorMap.length - 1}`} `);
+
+        // Render the boot data 
+        header = this.formatHeader(`BOOT Characteristics`, `` );
+        retVal.push(`<span class="sector-header">${header}</span>`);     
+        retVal.push(`Bootable: ${this.prettyByte(this.bootData.bootable)} (${ (this.bootData.bootable > 0) ? 'Yes' : 'No'})`);
+        retVal.push(`Num Boot Sectors: ${this.prettyByte(this.bootData.bootCount)}`);
+        retVal.push(`Load Address: ${this.prettyByte(this.bootData.loadAddy, 4)}`);
+        retVal.push(`Run Address: ${this.prettyByte(this.bootData.runAddy, 4)}`);
 
         // Render all other sectors in order 
         for ( let i = 1; i < this.sectorMap.length; i++) {
@@ -2295,6 +2314,7 @@ class AtariDisk {
 
             // If it's the last line of a data sector that has a link to the next sector, then add a jump button to the next sector
             let jumpData = null;
+            let otherData = null
             if (sector.type === 'data' && i + lineLength >= this.header.sectorSize && nextSectorIndex > 0) {
                 jumpData = { label: `[Next: ${hex(nextSectorIndex,4)} (${nextSectorIndex})]`, style: 'data-jump', sector: nextSectorIndex };
             }
@@ -2305,7 +2325,9 @@ class AtariDisk {
                 const file = this.getFileByStartSector(startSector);
                 if (file) {
                     // Other file data availabel here if needed:
-                    jumpData = { label: `[Jump to File]`, style: 'file-jump', sector: file.startSector };
+                    otherData = `${file.flags.raw} [${file.flags.isDeleted ? "D" : "-"}${file.flags.isInUse ? "U" : "-"}${file.flags.isLocked ? "L" : "-"}${file.flags.isDos2 ? "2" : "-"}${file.flags.isOpen ? "O" : "-"}]`;
+                    if ( file.flags.isInUse && !file.flags.isDeleted ) 
+                        jumpData = { label: `[Jump to File]`, style: 'file-jump', sector: file.startSector };
                 }
             }
 
@@ -2314,13 +2336,13 @@ class AtariDisk {
                 ? sector.offset + bytesUsed - 1
                 : sector.offset + 124; // full 125 bytes assumed valid
 
-            retVal.push(this.renderHexLine(offset, 16, lastValidByteId, jumpData));
+            retVal.push(this.renderHexLine(offset, 16, lastValidByteId, jumpData, otherData));
         }   
 
         return retVal.join("\n");
     }
 
-    renderHexLine(offset, length, lastValidByteId, jumpData) {
+    renderHexLine(offset, length, lastValidByteId, jumpData, otherData) {
 
         // Set the offset for this line
         var retVal = [hex(offset, 6) + " "];
@@ -2347,7 +2369,7 @@ class AtariDisk {
         }
 
         if (jumpData) {
-            ascii += ` <span class="jump-btn ${jumpData.style}" onclick="goto_sector(${jumpData.sector})">${jumpData.label}</span>`;
+            ascii += ` <span class="jump-btn ${jumpData.style}" onclick="goto_sector(${jumpData.sector})">${jumpData.label}</span> ${otherData || ''}`;
         }
 
         return retVal.join("") + " " + ascii;
@@ -2456,7 +2478,7 @@ function renderState(disks)
         var s = f.sectorCount.toString().padStart(3, '0');  // pad sector count 
         var n = f.name.padEnd(8, ' '); // pad name 
         var e = f.ext.padEnd(3, ' '); // pad name 
-        var locked = f.isLocked ? "*" : " ";
+        var locked = f.flags.isLocked ? "*" : " ";
         
         return `  ${locked} ${n}${e} ${s}  `;
     }
@@ -2466,7 +2488,8 @@ function renderState(disks)
         disks.forEach(disk => {
             disk.files.forEach(file => {
                 // Use the same ID prefix we used in the HTML map above
-                draw_line(`#canvas_${file.id}`, getDirectoryLine(file));
+                if ( file.flags.isInUse )
+                    draw_line(`#canvas_${file.id}`, getDirectoryLine(file));
             });
         });
     }, 0); 
@@ -2481,7 +2504,7 @@ function renderFile(file)
             ${txt ? `<button style="float:right;" onclick="save(1)">Save As LST</button>` : ""}
             <button style="float:right;" onclick="save(0)">Download</button>
         </div>
-        <div id="file">${txt ? `<canvas id="show"></canvas>` : `<pre style="padding:8px" id="show">eh?</pre>`}</div>`
+        <div id="file">${txt ? `<canvas id="show"></canvas>` : `<pre style="padding:8px" id="show">[Something went wrong...]</pre>`}</div>`
     );
 }
 
